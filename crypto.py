@@ -278,7 +278,7 @@ def get_latest_funding_rate(symbol: str = "SOLUSDT") -> float:
     data = fetch_json(BINANCE_FUNDING_URL, params={"symbol": symbol, "limit": 5})
     if not data:
         raise RuntimeError("Empty funding history from Binance")
-    return float(data[-1]["fundingRate"]) * 100.0
+    return float(data[-1]["fundingRate"])
 
 
 def get_open_interest(symbol: str = "SOLUSDT") -> float:
@@ -509,9 +509,9 @@ def score_momentum(funding_rate_pct: float, oi_change_7d: float) -> float:
     score = 50.0
     if funding_rate_pct < 0:
         score += 10.0
-    elif funding_rate_pct > 0.10:
+    elif funding_rate_pct > 0.0010:
         score -= 20.0
-    elif funding_rate_pct > 0.03:
+    elif funding_rate_pct > 0.0003:
         score -= 8.0
     else:
         score += 5.0
@@ -524,11 +524,10 @@ def apply_funding_guardrails(final_score: float, funding_rate_pct: float) -> tup
     adjusted = final_score
     regime_override = None
 
-    if funding_rate_pct > 0.10:
-        funding_penalty = min(0.40, (funding_rate_pct - 0.10) * 0.50)
-        adjusted *= 1.0 - funding_penalty
+    if funding_rate_pct > 0.0010:
+        adjusted *= 0.90
 
-    if funding_rate_pct > 0.15 and adjusted > 65:
+    if funding_rate_pct > 0.0015 and adjusted > 65:
         adjusted *= 0.90
         regime_override = "Cautious Accumulation (High Funding)"
 
@@ -581,11 +580,9 @@ def apply_risk_allocation_guardrails(
 ) -> tuple[int, int, int, int]:
     adjusted_risk = float(total_risk)
 
-    if funding_rate_pct > 0.10:
-        funding_penalty = min(0.40, (funding_rate_pct - 0.10) * 0.50)
-        adjusted_risk *= 1.0 - funding_penalty * 0.70
-
-    if funding_rate_pct > 0.15 and final_score > 65:
+    if funding_rate_pct > 0.0015:
+        adjusted_risk *= 0.60
+    elif funding_rate_pct > 0.0010:
         adjusted_risk *= 0.70
 
     adjusted_risk = max(0.0, min(100.0, adjusted_risk))
@@ -728,16 +725,16 @@ def interpret_total3(inputs: MarketInputs, result: MarketResult) -> str:
 def interpret_momentum(inputs: MarketInputs, result: MarketResult) -> str:
     if result.momentum_score >= 60:
         return (
-            f"Perp positioning is constructive: funding is {inputs.funding_rate:.4f}% "
+            f"Perp positioning is constructive: funding is {inputs.funding_rate * 100.0:.4f}% "
             f"and open interest changed {inputs.open_interest_change_7d:.2f}% over 7d."
         )
     if result.momentum_score >= 50:
         return (
-            f"Perp positioning is mixed: funding is {inputs.funding_rate:.4f}% "
+            f"Perp positioning is mixed: funding is {inputs.funding_rate * 100.0:.4f}% "
             f"and open interest changed {inputs.open_interest_change_7d:.2f}% over 7d."
         )
     return (
-        f"Perp positioning is overheated or fading: funding is {inputs.funding_rate:.4f}% "
+        f"Perp positioning is overheated or fading: funding is {inputs.funding_rate * 100.0:.4f}% "
         f"and open interest changed {inputs.open_interest_change_7d:.2f}% over 7d."
     )
 
@@ -778,7 +775,7 @@ def print_interpretation(inputs: MarketInputs, result: MarketResult) -> None:
     print("- Rebalance if target allocation differs by >10 percentage points")
     print("- Increase risk only if final_score > 70 and dominance_trend_score > 50")
     print("- Reduce risk if final_score < 60 or funding_rate > 0.10%")
-    print("- If funding_rate > 0.15% and final_score stays bullish, apply cautious accumulation haircut")
+    print("- Cut target risk to 70% of baseline above 0.10% funding and to 60% above 0.15%")
     print("- Aggressive derisk if final_score < 40")
 
 
