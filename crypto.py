@@ -34,7 +34,7 @@ import csv
 import io
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -45,6 +45,7 @@ COINGECKO_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 DEFI_LLAMA_STABLES_URL = "https://stablecoins.llama.fi/stablecoincharts/all"
 FRED_CSV_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+STOOQ_DXY_CSV_URL = "https://stooq.com/q/l/"
 BINANCE_FUNDING_URL = "https://fapi.binance.com/fapi/v1/fundingRate"
 BINANCE_OPEN_INTEREST_URL = "https://fapi.binance.com/fapi/v1/openInterest"
 BINANCE_OPEN_INTEREST_HIST_URL = "https://fapi.binance.com/futures/data/openInterestHist"
@@ -57,6 +58,9 @@ class MarketInputs:
     mvrv: float
     fed_rate: float
     treasury_3m_yield: float
+    dxy: float
+    fed_balance_usd: float
+    fed_balance_30d_change_pct: float
     stablecoin_market_cap_usd: float
     stablecoin_share: float
     stablecoin_30d_change: float
@@ -191,19 +195,117 @@ def format_ts(ts: int | float | None) -> str:
 
 
 def get_latest_fred_value(series_id: str) -> float:
-    csv_text = fetch_text(FRED_CSV_URL, params={"id": series_id})
-    rows = csv.DictReader(io.StringIO(csv_text))
+    rows = _get_fred_rows(series_id)
 
     latest_value: float | None = None
     for row in rows:
-        value = row.get(series_id)
-        if value and value != ".":
-            latest_value = float(value)
+        _, value = _parse_fred_row(row, series_id)
+        if value is not None:
+            latest_value = value
 
     if latest_value is None:
         raise RuntimeError(f"No valid FRED value found for {series_id}")
 
     return latest_value
+
+
+def get_latest_dxy_value() -> float:
+    try:
+        csv_text = fetch_text(STOOQ_DXY_CSV_URL, params={"s": "dx.f", "f": "sd2t2ohlcv", "h": "", "e": "csv"})
+        rows = list(csv.DictReader(io.StringIO(csv_text)))
+        if rows:
+            row = rows[-1]
+            close_value = row.get("Close") or row.get("close")
+            if close_value:
+                return float(close_value)
+    except Exception:
+        pass
+
+    return get_latest_fred_value("DTWEXBGS")
+
+
+def _get_fred_rows(series_id: str) -> list[dict[str, str]]:
+    csv_text = fetch_text(FRED_CSV_URL, params={"id": series_id})
+    reader = csv.DictReader(io.StringIO(csv_text))
+    rows: list[dict[str, str]] = []
+    for row in reader:
+        normalized_row = {(key or "").strip(): (value or "").strip() for key, value in row.items()}
+        if any(normalized_row.values()):
+            rows.append(normalized_row)
+    return rows
+
+
+def _parse_fred_row(row: dict[str, str], series_id: str) -> tuple[date | None, float | None]:
+    row_date = None
+
+    for key, raw_value in row.items():
+        if not raw_value:
+            continue
+        normalized_key = key.strip().upper()
+        if normalized_key == "DATE":
+            try:
+                row_date = datetime.strptime(raw_value, "%Y-%m-%d").date()
+                break
+            except ValueError:
+                pass
+
+    if row_date is None:
+        for raw_value in row.values():
+            if not raw_value:
+                continue
+            try:
+                row_date = datetime.strptime(raw_value, "%Y-%m-%d").date()
+                break
+            except ValueError:
+                continue
+
+    preferred = row.get(series_id, "")
+    if preferred and preferred != ".":
+        return row_date, float(preferred)
+
+    for key, raw_value in row.items():
+        if key.strip().upper() == "DATE":
+            continue
+        if not raw_value or raw_value == ".":
+            continue
+        try:
+            return row_date, float(raw_value)
+        except ValueError:
+            continue
+
+    return row_date, None
+
+
+def get_fred_value_days_back(series_id: str, days_back: int) -> float:
+    rows = _get_fred_rows(series_id)
+
+    latest_row_date = None
+    for row in rows:
+        row_date, raw_value = _parse_fred_row(row, series_id)
+        if row_date is None or raw_value is None:
+            continue
+        latest_row_date = row_date
+
+    if latest_row_date is None:
+        latest_value = get_latest_fred_value(series_id)
+        return latest_value
+
+    target_date = latest_row_date - timedelta(days=days_back)
+    candidate_value: float | None = None
+    candidate_date = None
+    for row in rows:
+        row_date, raw_value = _parse_fred_row(row, series_id)
+        if row_date is None or raw_value is None:
+            continue
+
+        if row_date <= target_date:
+            candidate_value = raw_value
+            candidate_date = row_date
+
+    if candidate_value is None or candidate_date is None:
+        return get_latest_fred_value(series_id)
+
+    return candidate_value
 
 
 def get_global_market_data() -> dict[str, float]:
@@ -431,12 +533,19 @@ def build_market_inputs(*, realized_price: float | None = None, mvrv: float | No
     stablecoin_market_cap = float(stable["stablecoin_market_cap_usd"])
     stable_share = stablecoin_market_cap / total_market_cap * 100.0
 
+    dxy = get_latest_dxy_value()
+    fed_balance = get_latest_fred_value("WALCL")
+    fed_balance_30d_ago = get_fred_value_days_back("WALCL", 30)
+
     return MarketInputs(
         price=round(price, 8),
         realized_price=round(resolved_realized_price, 8),
         mvrv=round(resolved_mvrv, 8),
         fed_rate=round(get_latest_fred_value("DFEDTARU"), 3),
         treasury_3m_yield=round(get_latest_fred_value("DTB3"), 3),
+        dxy=round(dxy, 3),
+        fed_balance_usd=round(fed_balance, 2),
+        fed_balance_30d_change_pct=round(pct_change(fed_balance, fed_balance_30d_ago), 3),
         stablecoin_market_cap_usd=round(stablecoin_market_cap, 2),
         stablecoin_share=round(stable_share, 3),
         stablecoin_30d_change=round(float(stable["stablecoin_30d_change"]), 3),
@@ -478,6 +587,18 @@ def score_macro(treasury_3m_yield: float, fed_rate: float) -> float:
     spread = fed_rate - treasury_3m_yield
     spread_bonus = clamp((spread / 0.25) * 5.0, 0.0, 8.0)
     return clamp(0.55 * clamp(yield_score) + 0.45 * clamp(fed_score) + spread_bonus)
+
+
+def apply_macro_liquidity_overlays(macro_score: float, dxy: float, fed_balance_30d_change_pct: float) -> float:
+    adjusted = macro_score
+
+    if dxy > 103.0:
+        adjusted *= 1.0 - min(0.40, (dxy - 103.0) * 0.02)
+
+    if fed_balance_30d_change_pct < -1.0:
+        adjusted *= 0.85
+
+    return clamp(adjusted)
 
 
 def score_stable(stablecoin_share: float, stablecoin_30d_change: float) -> float:
@@ -666,16 +787,19 @@ def interpret_macro_score(inputs: MarketInputs, result: MarketResult) -> str:
     if result.macro_score >= 65:
         return (
             f"Macro backdrop is supportive with 3M yield at {inputs.treasury_3m_yield:.2f}% "
-            f"and Fed rate at {inputs.fed_rate:.2f}%."
+            f"Fed rate at {inputs.fed_rate:.2f}%, DXY at {inputs.dxy:.2f}, and "
+            f"Fed balance 30d change at {inputs.fed_balance_30d_change_pct:.2f}%."
         )
     if result.macro_score >= 50:
         return (
             f"Macro is mixed: 3M yield is {inputs.treasury_3m_yield:.2f}% "
-            f"and Fed rate is {inputs.fed_rate:.2f}%."
+            f"Fed rate is {inputs.fed_rate:.2f}%, DXY is {inputs.dxy:.2f}, and "
+            f"Fed balance 30d change is {inputs.fed_balance_30d_change_pct:.2f}%."
         )
     return (
         f"Macro remains restrictive with 3M yield at {inputs.treasury_3m_yield:.2f}% "
-        f"and Fed rate at {inputs.fed_rate:.2f}%."
+        f"Fed rate at {inputs.fed_rate:.2f}%, DXY at {inputs.dxy:.2f}, and "
+        f"Fed balance 30d change at {inputs.fed_balance_30d_change_pct:.2f}%."
     )
 
 
@@ -784,6 +908,11 @@ def compute_market_score(inputs: MarketInputs) -> MarketResult:
     mvrv_score = score_mvrv(inputs.mvrv)
     stable_score = score_stable(inputs.stablecoin_share, inputs.stablecoin_30d_change)
     macro_score = score_macro(inputs.treasury_3m_yield, inputs.fed_rate)
+    macro_score = apply_macro_liquidity_overlays(
+        macro_score,
+        inputs.dxy,
+        inputs.fed_balance_30d_change_pct,
+    )
     dominance_score = score_dominance_level(
         inputs.sol_dominance,
         inputs.btc_dominance,
@@ -843,6 +972,8 @@ def print_inputs_log() -> None:
     print("stablecoin_market_cap_usd / stablecoin_30d_change <- DeFiLlama stablecoin history")
     print("treasury_3m_yield <- FRED DTB3")
     print("fed_rate <- FRED DFEDTARU (Federal Funds Target Range - Upper Limit)")
+    print("dxy <- Stooq DX futures close when available, otherwise FRED DTWEXBGS fallback")
+    print("fed_balance_usd / fed_balance_30d_change_pct <- FRED WALCL")
     print("funding_rate / open_interest / open_interest_change_7d <- Binance Futures SOLUSDT")
     print("total3_30d_change <- proxy from current TOTAL3 and 30d BTC+ETH+SOL historical basket")
     print("btc_dominance_30d_change / sol_dominance_30d_change <- proxy from 30d historical market caps")
